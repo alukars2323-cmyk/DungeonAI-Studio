@@ -1,0 +1,45 @@
+{
+  "name": "dungeonai-studio",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "dev": "NODE_USE_ENV_PROXY=1 tsx server/index.ts",
+    "start": "NODE_ENV=production NODE_USE_ENV_PROXY=1 tsx server/index.ts",
+    "typecheck": "tsc --noEmit",
+    "build": "npm run typecheck && vite build",
+    "build:pages": "VITE_STORAGE_MODE=browser VITE_BASE_PATH=/DungeonAI-Studio/ npm run build",
+    "preview:pages": "node scripts/serve-pages.mjs",
+    "test": "tsx --test tests/*.test.ts",
+    "test:e2e": "playwright test",
+    "test:pages": "playwright test --config playwright.pages.config.ts"
+  },
+  "dependencies": {
+    "express": "5.3.0",
+    "fflate": "0.8.3",
+    "lucide-react": "0.468.0",
+    "multer": "2.4.0",
+    "pngjs": "7.0.0",
+    "react": "19.1.1",
+    "react-dom": "19.1.1",
+    "yauzl": "3.4.0",
+    "zod": "3.25.76"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.56.1",
+    "@types/express": "5.0.3",
+    "@types/multer": "2.0.0",
+    "@types/node": "24.7.2",
+    "@types/pngjs": "6.0.5",
+    "@types/react": "19.1.16",
+    "@types/react-dom": "19.1.9",
+    "@types/yauzl": "2.10.3",
+    "@vitejs/plugin-react": "5.0.4",
+    "tsx": "4.20.6",
+    "typescript": "5.9.3",
+    "vite": "7.3.7"
+  }
+}
