@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { PointerEvent as ReactPointerEvent } from 'react';
 import type { Asset, BuiltinKind, MapDocument, MapElement, ObjectElement, RectElement } from '../shared/types';
-import { CELL_SIZE, exportMapPng, preloadMapAssets, renderMap } from './mapRenderer';
+import { CELL_SIZE, exportMapPng, preloadMapAssets, renderMap, retainMapAssetImages } from './mapRenderer';
 import type { VisibleLayers } from './mapRenderer';
 
 export type Tool = 'select' | 'room' | 'corridor' | 'wall' | 'object' | 'erase' | 'pan';
@@ -94,8 +94,10 @@ export function MapCanvas(props: MapCanvasProps) {
   const setInteraction = useCallback((next: Interaction | null) => { interactionRef.current = next; setInteractionState(next); }, []);
   useEffect(() => {
     let active = true;
-    preloadMapAssets(document, assets).then(() => { if (active) { setAssetError(''); setImageRevision(value => value + 1); } }).catch(error => { if (active) setAssetError(error instanceof Error ? error.message : 'Не удалось загрузить PNG.'); });
-    return () => { active = false; };
+    const controller = new AbortController();
+    const release = retainMapAssetImages(document, assets);
+    preloadMapAssets(document, assets, { signal: controller.signal }).then(() => { if (active) { setAssetError(''); setImageRevision(value => value + 1); } }).catch(error => { if (active) setAssetError(error instanceof Error ? error.message : 'Не удалось загрузить PNG.'); });
+    return () => { active = false; controller.abort(); release(); };
   }, [document, assets]);
 
   useEffect(() => {

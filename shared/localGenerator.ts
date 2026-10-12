@@ -53,6 +53,41 @@ export function requestedAssets(input: GenerationInput, assets: Asset[]): Asset[
   });
 }
 
+/** Choose a fitting subset for the UI's automatic-library option. */
+export function selectLibraryAssets(rawInput: GenerationInput, library: Asset[]): Asset[] {
+  const input = generationInputSchema.parse({ ...rawInput, assetIds: [] });
+  const rooms = roomLayout(input, seededRandom(input.seed));
+  const slots = rooms.reduce((total, room) => total
+    + Math.max(1, Math.floor((room.width - 0.6) / 1.6)) * Math.max(1, Math.floor((room.height - 0.6) / 1.6)), 0);
+  const prompt = `${input.prompt} ${input.theme}`.toLowerCase();
+  const ranked = library.map((asset, index) => ({
+    asset,
+    index,
+    score: [...asset.tags, ...asset.name.split(/[\s_.-]+/)].reduce((score, tag) =>
+      score + (tag.length >= 3 && prompt.includes(tag.toLowerCase()) ? 1 : 0), 0),
+    tie: seededRandom(`${input.seed}:${asset.id}`)(),
+  }));
+  const textures = (['floors', 'walls'] as const).flatMap(category => {
+    const chosen = ranked.filter(item => item.asset.category === category)
+      .sort((a, b) => b.score - a.score || a.index - b.index)[0];
+    return chosen ? [chosen.asset] : [];
+  });
+  // Originals stay intact; automatic maps avoid decoding hundreds of huge PNGs.
+  let remainingPixels = Math.max(0, 128 * 1024 * 1024
+    - textures.reduce((total, asset) => total + asset.width * asset.height, 0));
+  const objects: Asset[] = [];
+  const capacity = Math.min(slots, 200 - textures.length);
+  for (const item of ranked.filter(item => item.asset.category === 'objects')
+    .sort((a, b) => b.score - a.score || a.tie - b.tie || a.index - b.index)) {
+    if (objects.length >= capacity) break;
+    const pixels = item.asset.width * item.asset.height;
+    if (pixels > remainingPixels) continue;
+    objects.push(item.asset);
+    remainingPixels -= pixels;
+  }
+  return [...textures, ...objects];
+}
+
 export function baseDocument(input: GenerationInput, elements: MapElement[], mode: 'local' | 'ai', name?: string, assets: Asset[] = []): MapDocument {
   const timestamp = new Date().toISOString();
   const floorAsset = assets.find(asset => asset.category === 'floors');

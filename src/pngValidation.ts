@@ -1,8 +1,8 @@
 import { ApiError } from './apiError';
+import { IMPORT_LIMITS, IMPORT_LIMIT_TEXT } from '../shared/importLimits';
 
-export const MiB = 1024 * 1024;
-export const MAX_FILE_BYTES = 8 * MiB;
-const MAX_PIXELS = 16 * 1024 * 1024;
+export { MiB } from '../shared/importLimits';
+export const MAX_FILE_BYTES = IMPORT_LIMITS.pngBytes;
 const signature = [137, 80, 78, 71, 13, 10, 26, 10];
 
 const crcTable = new Uint32Array(256);
@@ -30,7 +30,7 @@ export interface PreparedBrowserAsset {
 
 /** Check every chunk before trusting the browser decoder (which may ignore CRC errors). */
 export async function validatePng(data: Uint8Array, filename: string, pack?: string): Promise<PreparedBrowserAsset> {
-  if (data.length > MAX_FILE_BYTES) throw new ApiError('PNG превышает лимит 8 МиБ.', 413);
+  if (data.length > IMPORT_LIMITS.pngBytes) throw new ApiError(IMPORT_LIMIT_TEXT.png, 413);
   if (data.length < 33 || signature.some((byte, index) => data[index] !== byte)
     || String.fromCharCode(...data.subarray(12, 16)) !== 'IHDR') {
     throw new ApiError(`«${filename}» не является PNG.`, 400);
@@ -38,8 +38,8 @@ export async function validatePng(data: Uint8Array, filename: string, pack?: str
   const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
   const width = view.getUint32(16);
   const height = view.getUint32(20);
-  if (!width || !height || width > 8192 || height > 8192 || width * height > MAX_PIXELS) {
-    throw new ApiError('PNG должен быть не больше 8192 пикселей по стороне и 16 мегапикселей.', 400);
+  if (!width || !height || width > IMPORT_LIMITS.pngSide || height > IMPORT_LIMITS.pngSide || width * height > IMPORT_LIMITS.pngPixels) {
+    throw new ApiError(IMPORT_LIMIT_TEXT.pixels, 400);
   }
   const malformed = () => new ApiError(`PNG «${filename}» повреждён или имеет неподдерживаемую структуру.`, 400);
   let cursor = 8;

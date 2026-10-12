@@ -3,6 +3,8 @@ import { readFile } from 'node:fs/promises';
 import { zipSync } from 'fflate';
 import { PNG } from 'pngjs';
 import type { MapDocument } from '../../shared/types';
+import { IMPORT_LIMITS, GiB } from '../../shared/importLimits';
+import { largePngFixture } from '../uploadFixtures';
 
 const DRAFT_KEY = 'dungeonai-studio:browser-draft:v1';
 const DB_NAME = 'dungeonai-studio:browser:v1';
@@ -44,6 +46,30 @@ async function storedAssets(page: Page) {
       read.onerror = () => { db.close(); reject(read.error); };
     };
   }), DB_NAME);
+}
+
+async function stagedCount(page: Page): Promise<number> {
+  return page.evaluate(name => new Promise<number>((resolve, reject) => {
+    const open = indexedDB.open(name);
+    open.onerror = () => reject(open.error);
+    open.onsuccess = () => {
+      const db = open.result;
+      const read = db.transaction('importStaging').objectStore('importStaging').count();
+      read.onsuccess = () => { db.close(); resolve(read.result); };
+      read.onerror = () => { db.close(); reject(read.error); };
+    };
+  }), DB_NAME);
+}
+
+function declareZipSizes(zip: Buffer, bytes: number) {
+  let cursor = zip.indexOf(Buffer.from([0x50, 0x4b, 0x01, 0x02]));
+  while (cursor >= 0 && zip.readUInt32LE(cursor) === 0x02014b50) {
+    const localOffset = zip.readUInt32LE(cursor + 42);
+    zip.writeUInt32LE(bytes, cursor + 24);
+    zip.writeUInt32LE(bytes, localOffset + 22);
+    cursor += 46 + zip.readUInt16LE(cursor + 28) + zip.readUInt16LE(cursor + 30) + zip.readUInt16LE(cursor + 32);
+  }
+  return zip;
 }
 
 async function start(page: Page) {
@@ -141,6 +167,7 @@ test('browser PNG and ZIP validation rejects corruption, unsafe archives and ove
   ]);
   await expect(page.getByRole('alert')).toContainText('повреждён');
   expect(await storedAssets(page)).toHaveLength(0);
+  expect(await stagedCount(page)).toBe(0);
 
   const zip = Buffer.from(zipSync({ 'image.png': good }));
   const central = zip.indexOf(Buffer.from([0x50, 0x4b, 0x01, 0x02]));
@@ -154,17 +181,34 @@ test('browser PNG and ZIP validation rejects corruption, unsafe archives and ove
   const bombCentral = bomb.indexOf(Buffer.from([0x50, 0x4b, 0x01, 0x02]));
   bomb.writeUInt32LE(100, 22);
   bomb.writeUInt32LE(100, bombCentral + 24);
+  const zip64 = Buffer.from(zipSync({ 'image.png': good }));
+  zip64.writeUInt16LE(0xffff, zip64.length - 22 + 8);
+  zip64.writeUInt16LE(0xffff, zip64.length - 22 + 10);
+  const expanded = declareZipSizes(Buffer.from(zipSync({ 'a.txt': new Uint8Array(0), 'b.txt': new Uint8Array(0), 'c.txt': new Uint8Array(0) })), 3 * GiB);
+  const largeHeader = declareZipSizes(Buffer.from(zipSync({ 'large.png': good })), IMPORT_LIMITS.pngBytes + 1);
+  const normal = Buffer.from(zipSync({ 'tail.png': good }));
+  const normalCentral = normal.indexOf(Buffer.from([0x50, 0x4b, 0x01, 0x02]));
+  const junkBytes = 1024 * 1024;
+  const trailingJunk = Buffer.concat([normal.subarray(0, normalCentral), Buffer.alloc(junkBytes), normal.subarray(normalCentral)]);
+  const junkCentral = normalCentral + junkBytes;
+  trailingJunk.writeUInt32LE(trailingJunk.readUInt32LE(18) + junkBytes, 18);
+  trailingJunk.writeUInt32LE(trailingJunk.readUInt32LE(junkCentral + 20) + junkBytes, junkCentral + 20);
+  trailingJunk.writeUInt32LE(junkCentral, trailingJunk.length - 22 + 16);
   const cases = [
     { name: 'checksum.zip', buffer: zip, error: 'Контрольная сумма' },
     { name: 'path.zip', buffer: Buffer.from(zipSync({ '../escape.png': good })), error: 'небезопасный путь' },
     { name: 'encrypted.zip', buffer: encrypted, error: 'Зашифрованные' },
     { name: 'bomb.zip', buffer: bomb, error: 'слишком большой' },
-    { name: 'count.zip', buffer: Buffer.from(zipSync(Object.fromEntries(Array.from({ length: 201 }, (_, index) => [`${index}.txt`, new Uint8Array(0)])))), error: '200 записей' },
+    { name: 'zip64.zip', buffer: zip64, error: 'ZIP64' },
+    { name: 'expanded.zip', buffer: expanded, error: '8 ГиБ' },
+    { name: 'large-header.zip', buffer: largeHeader, error: '64 МиБ' },
+    { name: 'trailing-junk.zip', buffer: trailingJunk, error: 'Сжатый файл ZIP повреждён' },
   ];
   for (const file of cases) {
     await page.locator('input[type=file]').first().setInputFiles({ name: file.name, mimeType: 'application/zip', buffer: file.buffer });
     await expect(page.getByRole('alert')).toContainText(file.error);
     expect(await storedAssets(page)).toHaveLength(0);
+    expect(await stagedCount(page)).toBe(0);
   }
   await page.locator('input[type=file]').first().setInputFiles({ name: 'recovered.png', mimeType: 'image/png', buffer: good });
   await expect(page.getByRole('button', { name: 'Разместить ассет recovered', exact: true })).toBeVisible();
@@ -234,4 +278,113 @@ test('concurrent save and image deletion in different tabs cannot create a broke
     expect(project.elements.filter(element => element.type === 'room' || element.type === 'corridor')
       .every(element => 'floorAssetId' in element && available.has(element.floorAssetId!))).toBeTruthy();
   }
+});
+
+test('large PNGs and asset batches above the former limits publish fully and report progress', async ({ page }) => {
+  await start(page);
+  await page.evaluate(() => {
+    const events: { processed: number; total: number; phase: string }[] = [];
+    (window as typeof window & { importEvents: typeof events }).importEvents = events;
+    window.addEventListener('dungeonai-import-progress', event => events.push((event as CustomEvent).detail));
+  });
+  const large = largePngFixture();
+  expect(large.length).toBeGreaterThan(8 * 1024 * 1024);
+  await page.locator('input[type=file]').first().setInputFiles({ name: 'large-real.png', mimeType: 'image/png', buffer: large });
+  await expect(page.getByText('Добавлено ассетов: 1', { exact: true })).toBeVisible();
+  expect((await storedAssets(page))[0].blobSize).toBe(large.length);
+  expect(await stagedCount(page)).toBe(0);
+  const archive = zipSync(Object.fromEntries(Array.from({ length: 205 }, (_, index) => [`bulk/bulk-${String(index).padStart(3, '0')}.png`, markerPng()])));
+  await page.locator('input[type=file]').first().setInputFiles({ name: 'large-library.zip', mimeType: 'application/zip', buffer: Buffer.from(archive) });
+  await expect(page.getByText('Добавлено ассетов: 205', { exact: true })).toBeVisible();
+  expect(await storedAssets(page)).toHaveLength(206);
+  expect(await stagedCount(page)).toBe(0);
+  await expect(page.locator('.uploaded-card')).toHaveCount(96);
+  await page.getByRole('button', { name: 'Следующая страница ассетов', exact: true }).click();
+  await expect(page.locator('.asset-pagination')).toContainText('97–192 из 206');
+  await page.getByRole('textbox', { name: 'Поиск ассетов', exact: true }).fill('bulk-204');
+  await expect(page.getByRole('button', { name: 'Разместить ассет bulk-204', exact: true })).toBeVisible();
+  await expect(page.locator('.uploaded-card')).toHaveCount(1);
+  await page.getByRole('textbox', { name: 'Поиск ассетов', exact: true }).fill('');
+  await page.locator('input[type=file]').first().setInputFiles(Array.from({ length: 35 }, (_, index) => ({
+    name: `loose-${index}.png`, mimeType: 'image/png', buffer: markerPng(),
+  })));
+  await expect(page.getByText('Добавлено ассетов: 35', { exact: true })).toBeVisible();
+  expect(await storedAssets(page)).toHaveLength(241);
+  expect(await stagedCount(page)).toBe(0);
+  const events = await page.evaluate(() => (window as typeof window & { importEvents: { processed: number; total: number; phase: string }[] }).importEvents);
+  expect(events.some(event => event.phase === 'validate' && event.processed === 205 && event.total === 205)).toBeTruthy();
+  expect(events.some(event => event.phase === 'commit' && event.processed === 205 && event.total === 205)).toBeTruthy();
+  expect(events.every(event => event.processed >= 0 && event.processed <= event.total)).toBeTruthy();
+  await page.getByRole('button', { name: 'Создать карту', exact: true }).first().click();
+  await page.locator('#map-prompt').fill('Таверна с 3 комнатами');
+  await page.getByRole('spinbutton', { name: 'Ширина карты в клетках', exact: true }).fill('24');
+  await page.getByRole('spinbutton', { name: 'Высота карты в клетках', exact: true }).fill('20');
+  await page.locator('.generate-button').click();
+  await expect(page.getByText('Карта создана локальным процедурным генератором', { exact: true })).toBeVisible();
+  const map = await draft(page);
+  expect(map.elements.some(element => element.type === 'object' && element.assetId)).toBeTruthy();
+  await expect(page.getByRole('alert')).toHaveCount(0);
+});
+
+test('version 1 projects and PNGs survive IndexedDB migration and only abandoned old staging is removed', async ({ page }) => {
+  // An empty same-origin page lets us seed an actual old database before the app opens it.
+  await page.route('**/migration-seed.html', route => route.fulfill({ status: 200, contentType: 'text/html', body: '<!doctype html><html><body>Migration fixture</body></html>' }));
+  await page.goto('./migration-seed.html');
+  const now = new Date().toISOString();
+  const document: MapDocument = {
+    schemaVersion: 1, id: 'migration-project', name: 'Сохранено до обновления', createdAt: now, updatedAt: now,
+    width: 12, height: 12, gridSize: 32, theme: 'crypt', seed: 'migration', prompt: '', generationMode: 'manual',
+    elements: [{ id: 'migration-object', type: 'object', x: 3, y: 3, width: 2, height: 1, rotation: 0, kind: 'chest', assetId: 'migration-image' }],
+  };
+  await page.evaluate(({ name, bytes, document }) => new Promise<void>((resolve, reject) => {
+    const open = indexedDB.open(name, 1);
+    open.onupgradeneeded = () => {
+      open.result.createObjectStore('assets', { keyPath: 'id' });
+      open.result.createObjectStore('projects', { keyPath: 'id' });
+    };
+    open.onerror = () => reject(open.error);
+    open.onsuccess = () => {
+      const db = open.result;
+      const tx = db.transaction(['assets', 'projects'], 'readwrite');
+      tx.objectStore('assets').add({ id: 'migration-image', name: 'старый PNG', filename: 'старый PNG.png', width: 16, height: 8,
+        category: 'objects', tags: [], createdAt: document.createdAt, blob: new Blob([new Uint8Array(bytes)], { type: 'image/png' }) });
+      tx.objectStore('projects').add(document);
+      tx.oncomplete = () => { db.close(); resolve(); };
+      tx.onabort = () => { db.close(); reject(tx.error); };
+    };
+  }), { name: DB_NAME, bytes: [...markerPng()], document });
+  await start(page);
+  expect((await storedProjects(page))[0]).toEqual(document);
+  expect(await storedAssets(page)).toHaveLength(1);
+  expect(await stagedCount(page)).toBe(0);
+  await page.getByRole('button', { name: 'Проекты', exact: true }).click();
+  await page.getByRole('button', { name: 'Открыть проект Сохранено до обновления', exact: true }).click();
+  await expect.poll(async () => (await draft(page)).id).toBe(document.id);
+  await page.getByRole('button', { name: 'Экспорт', exact: true }).click();
+  await page.locator('#export-scale').selectOption('1');
+  const download = page.waitForEvent('download');
+  await page.getByRole('button', { name: 'Скачать PNG', exact: true }).click();
+  const image = PNG.sync.read(await readFile((await (await download).path())!));
+  let markerPixels = 0;
+  for (let index = 0; index < image.data.length; index += 4) {
+    if (image.data[index] > 210 && image.data[index + 1] < 50 && image.data[index + 2] > 195) markerPixels++;
+  }
+  expect(markerPixels).toBeGreaterThan(500);
+  await page.evaluate(name => new Promise<void>((resolve, reject) => {
+    const open = indexedDB.open(name);
+    open.onerror = () => reject(open.error);
+    open.onsuccess = () => {
+      const db = open.result;
+      const tx = db.transaction('importStaging', 'readwrite');
+      tx.objectStore('importStaging').add({ id: 'old-staging', batchId: 'abandoned', stagedAt: Date.now() - 25 * 60 * 60 * 1000 });
+      tx.objectStore('importStaging').add({ id: 'other-tab-staging', batchId: 'active', stagedAt: Date.now() });
+      tx.oncomplete = () => { db.close(); resolve(); };
+      tx.onabort = () => { db.close(); reject(tx.error); };
+    };
+  }), DB_NAME);
+  await page.reload();
+  await expect(page.locator('.app-header').getByRole('button', { name: /^Сохранить/ })).toBeEnabled();
+  expect(await stagedCount(page)).toBe(1);
+  expect((await storedProjects(page))[0]).toEqual(document);
+  expect(await storedAssets(page)).toHaveLength(1);
 });

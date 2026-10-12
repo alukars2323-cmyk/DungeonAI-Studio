@@ -1,10 +1,12 @@
 import { randomUUID } from 'node:crypto';
-import { mkdir, open, readdir, readFile, rename, stat, unlink } from 'node:fs/promises';
+import { copyFile, mkdir, open, readdir, readFile, rename, stat, unlink } from 'node:fs/promises';
+import { constants } from 'node:fs';
 import path from 'node:path';
 import { z } from 'zod';
 import type { Asset, MapDocument, ProjectSummary } from '../shared/types.js';
 import { referencedAssetIds } from '../shared/assets.js';
 import { mapDocumentSchema } from '../shared/validation.js';
+import { IMPORT_LIMITS } from '../shared/importLimits.js';
 
 export class HttpError extends Error {
   constructor(public readonly status: number, message: string) {
@@ -18,8 +20,8 @@ const assetSchema = z.object({
   id: z.string().regex(safeId),
   name: z.string().min(1).max(120),
   filename: z.string().min(1).max(240),
-  width: z.number().int().positive().max(8192),
-  height: z.number().int().positive().max(8192),
+  width: z.number().int().positive().max(IMPORT_LIMITS.pngSide),
+  height: z.number().int().positive().max(IMPORT_LIMITS.pngSide),
   category: z.enum(['objects', 'floors', 'walls']),
   tags: z.array(z.string().min(1).max(40)).max(12),
   url: z.string(),
@@ -32,7 +34,8 @@ export interface PreparedAsset {
   filename: string;
   width: number;
   height: number;
-  data: Buffer;
+  /** Validated image staged on disk; batches do not retain decoded PNG buffers. */
+  sourcePath: string;
   pack?: string;
 }
 
@@ -61,19 +64,37 @@ async function atomicWrite(filename: string, data: string | Buffer): Promise<voi
   }
 }
 
+async function atomicCopy(source: string, filename: string): Promise<void> {
+  const temporary = `${filename}.${randomUUID()}.tmp`;
+  try {
+    await copyFile(source, temporary, constants.COPYFILE_EXCL);
+    const handle = await open(temporary, 'r');
+    try { await handle.sync(); }
+    finally { await handle.close(); }
+    await rename(temporary, filename);
+  } catch (error) {
+    await unlink(temporary).catch(() => undefined);
+    throw error;
+  }
+}
+
 /** All writes share one queue, including reference checks before deleting assets. */
 export class Storage {
   private readonly assetsDir: string;
   private readonly projectsDir: string;
+  private readonly commitsDir: string;
+  private readonly committedBatches = new Set<string>();
   private readonly ready: Promise<void>;
   private writes: Promise<unknown> = Promise.resolve();
 
   constructor(dataDir: string) {
     this.assetsDir = path.join(path.resolve(dataDir), 'assets');
     this.projectsDir = path.join(path.resolve(dataDir), 'projects');
+    this.commitsDir = path.join(this.assetsDir, '.commits');
     this.ready = Promise.all([
       mkdir(this.assetsDir, { recursive: true }),
       mkdir(this.projectsDir, { recursive: true }),
+      mkdir(this.commitsDir, { recursive: true }),
     ]).then(() => undefined);
   }
 
@@ -86,11 +107,20 @@ export class Storage {
     return result;
   }
 
-  private async readAsset(id: string): Promise<Asset> {
+  private async readAsset(id: string, visibleBatches?: ReadonlySet<string>): Promise<Asset> {
     assertId(id);
     try {
-      const asset = assetSchema.parse(JSON.parse(await readFile(path.join(this.assetsDir, `${id}.json`), 'utf8')));
+      const metadata = JSON.parse(await readFile(path.join(this.assetsDir, `${id}.json`), 'utf8')) as Record<string, unknown>;
+      const asset = assetSchema.parse(metadata);
       if (asset.id !== id) throw new Error('Asset identifier mismatch');
+      if (metadata.batchId !== undefined) {
+        if (typeof metadata.batchId !== 'string' || !safeId.test(metadata.batchId)) throw new Error('Invalid asset batch');
+        if (visibleBatches && !visibleBatches.has(metadata.batchId)) throw new HttpError(404, 'Ассет не найден.');
+        if (!this.committedBatches.has(metadata.batchId)) {
+          await stat(path.join(this.commitsDir, `${metadata.batchId}.json`));
+          this.committedBatches.add(metadata.batchId);
+        }
+      }
       await stat(path.join(this.assetsDir, `${id}.png`));
       return { ...asset, url: `/api/assets/${id}/file` };
     } catch (error) {
@@ -101,8 +131,21 @@ export class Storage {
 
   async listAssets(): Promise<Asset[]> {
     await this.ready;
+    // Capture committed batches before filenames, so a batch cannot become partially visible mid-read.
+    const visibleBatches = new Set((await readdir(this.commitsDir)).filter((name) => /^[A-Za-z0-9_-]{1,80}\.json$/.test(name)).map((name) => name.slice(0, -5)));
     const names = (await readdir(this.assetsDir)).filter((name) => /^[A-Za-z0-9_-]{1,80}\.json$/.test(name));
-    return (await Promise.all(names.map((name) => this.readAsset(name.slice(0, -5)))))
+    const visible: Asset[] = [];
+    for (let index = 0; index < names.length; index += 64) {
+      const batch = await Promise.all(names.slice(index, index + 64).map(async (name) => {
+        try { return await this.readAsset(name.slice(0, -5), visibleBatches); }
+        catch (error) {
+          if (error instanceof HttpError && error.status === 404) return undefined;
+          throw error;
+        }
+      }));
+      visible.push(...batch.filter((asset): asset is Asset => Boolean(asset)));
+    }
+    return visible
       .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
   }
 
@@ -116,6 +159,7 @@ export class Storage {
     return this.exclusive(async () => {
       const saved: Asset[] = [];
       const files: string[] = [];
+      const batchId = randomUUID();
       try {
         for (const item of prepared) {
           const id = randomUUID();
@@ -127,13 +171,21 @@ export class Storage {
           };
           assetSchema.parse(asset);
           const imageFilename = path.join(this.assetsDir, `${id}.png`);
-          await atomicWrite(imageFilename, item.data);
+          await atomicCopy(item.sourcePath, imageFilename);
           files.push(imageFilename);
-          const metadataFilename = path.join(this.assetsDir, `${id}.json`);
-          await atomicWrite(metadataFilename, JSON.stringify(asset));
-          files.push(metadataFilename);
           saved.push(asset);
         }
+        // All PNGs have been validated and copied before publishing catalogue entries.
+        for (const asset of saved) {
+          const metadataFilename = path.join(this.assetsDir, `${asset.id}.json`);
+          await atomicWrite(metadataFilename, JSON.stringify({ ...asset, batchId }));
+          files.push(metadataFilename);
+        }
+        // A single atomic marker makes the entire batch visible, including to concurrent readers.
+        const commitFilename = path.join(this.commitsDir, `${batchId}.json`);
+        await atomicWrite(commitFilename, JSON.stringify({ committedAt: new Date().toISOString() }));
+        files.push(commitFilename);
+        this.committedBatches.add(batchId);
         return saved;
       } catch (error) {
         await Promise.all(files.map((filename) => unlink(filename).catch(() => undefined)));

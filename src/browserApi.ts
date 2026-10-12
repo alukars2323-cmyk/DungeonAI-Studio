@@ -1,18 +1,16 @@
-import { Inflate } from 'fflate';
 import { z } from 'zod';
 import type { Asset, Capabilities, GenerationInput, MapDocument, ProjectSummary } from '../shared/types';
 import { referencedAssetIds } from '../shared/assets';
 import { generateLocalMap } from '../shared/localGenerator';
 import { GenerationError } from '../shared/generationError';
 import { generationInputSchema, identifierSchema, mapDocumentSchema } from '../shared/validation';
+import { IMPORT_LIMITS, IMPORT_LIMIT_TEXT, MiB } from '../shared/importLimits';
 import { ApiError } from './apiError';
-import { crc32, MAX_FILE_BYTES, MiB, validatePng, type PreparedBrowserAsset } from './pngValidation';
+import { crc32, validatePng, type PreparedBrowserAsset } from './pngValidation';
 
-const MAX_UPLOAD_BYTES = 16 * MiB;
-const MAX_EXPANDED_BYTES = 64 * MiB;
-const MAX_ENTRIES = 200;
 const DB_NAME = 'dungeonai-studio:browser:v1';
 type StoredAsset = Omit<Asset, 'url'> & { blob: Blob };
+type StagedAsset = StoredAsset & { batchId: string; stagedAt: number };
 const imageUrls = new Map<string, string>();
 let connection: Promise<IDBDatabase> | undefined;
 
@@ -32,12 +30,17 @@ function database(): Promise<IDBDatabase> {
     if (typeof indexedDB === 'undefined') { reject(new ApiError('Хранилище IndexedDB недоступно в этом браузере.', 503)); return; }
     let settled = false;
     let request: IDBOpenDBRequest;
-    try { request = indexedDB.open(DB_NAME, 1); }
+    try { request = indexedDB.open(DB_NAME, 2); }
     catch (error) { reject(storageError(error)); return; }
     request.onupgradeneeded = () => {
       const db = request.result;
       if (!db.objectStoreNames.contains('assets')) db.createObjectStore('assets', { keyPath: 'id' });
       if (!db.objectStoreNames.contains('projects')) db.createObjectStore('projects', { keyPath: 'id' });
+      if (!db.objectStoreNames.contains('importStaging')) {
+        const staging = db.createObjectStore('importStaging', { keyPath: 'id' });
+        staging.createIndex('batchId', 'batchId');
+        staging.createIndex('stagedAt', 'stagedAt');
+      }
     };
     request.onblocked = () => {
       settled = true;
@@ -51,6 +54,21 @@ function database(): Promise<IDBDatabase> {
       settled = true;
       resolve(db);
     };
+  }).then(async db => {
+    // A interrupted import stays invisible. Remove only old records, never another tab's active batch.
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction('importStaging', 'readwrite');
+      const old = tx.objectStore('importStaging').index('stagedAt').openKeyCursor(IDBKeyRange.upperBound(Date.now() - 24 * 60 * 60 * 1000));
+      old.onsuccess = () => {
+        const cursor = old.result;
+        if (!cursor) return;
+        tx.objectStore('importStaging').delete(cursor.primaryKey);
+        cursor.continue();
+      };
+      tx.oncomplete = () => resolve();
+      tx.onabort = () => { db.close(); reject(storageError(tx.error)); };
+    });
+    return db;
   }).catch(error => { connection = undefined; throw error; });
   return connection!;
 }
@@ -111,6 +129,7 @@ const assetChangesSchema = z.object({
 
 interface ZipEntry {
   name: string;
+  png: boolean;
   method: number;
   crc: number;
   size: number;
@@ -119,47 +138,74 @@ interface ZipEntry {
   directory: boolean;
 }
 
-/** The central directory supplies verified entry boundaries before any decompression. */
-function zipEntries(data: Uint8Array): ZipEntry[] {
-  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+class BlobReader {
+  private start = -1;
+  private buffer = new Uint8Array(0);
+  constructor(private readonly blob: Blob) {}
+
+  async read(offset: number, length: number): Promise<Uint8Array> {
+    if (!Number.isSafeInteger(offset) || !Number.isSafeInteger(length) || offset < 0 || length < 0 || offset + length > this.blob.size) {
+      throw new ApiError('ZIP повреждён: неверные границы записи.', 400);
+    }
+    if (offset < this.start || offset + length > this.start + this.buffer.length) {
+      this.start = offset;
+      this.buffer = new Uint8Array(await this.blob.slice(offset, Math.min(this.blob.size, offset + Math.max(length, 256 * 1024))).arrayBuffer());
+    }
+    return this.buffer.subarray(offset - this.start, offset - this.start + length);
+  }
+}
+
+function dataView(data: Uint8Array) { return new DataView(data.buffer, data.byteOffset, data.byteLength); }
+
+/** Inspect ZIP headers using small Blob slices, including for archives larger than memory. */
+async function zipEntries(file: Blob): Promise<ZipEntry[]> {
   const corrupt = () => new ApiError('ZIP повреждён или имеет неподдерживаемую структуру.', 400);
-  if (data.length < 22) throw corrupt();
+  const zip64 = () => new ApiError('ZIP64 пока не поддерживается. Используйте обычный ZIP, до 65 534 записей.', 415);
+  if (file.size < 22) throw corrupt();
+  const tailOffset = Math.max(0, file.size - 22 - 0xffff);
+  const tail = new Uint8Array(await file.slice(tailOffset).arrayBuffer());
+  const view = dataView(tail);
   let end = -1;
-  for (let cursor = data.length - 22; cursor >= Math.max(0, data.length - 22 - 0xffff); cursor--) {
-    if (view.getUint32(cursor, true) === 0x06054b50 && cursor + 22 + view.getUint16(cursor + 20, true) === data.length) { end = cursor; break; }
+  for (let cursor = tail.length - 22; cursor >= 0; cursor--) {
+    if (view.getUint32(cursor, true) === 0x06054b50 && cursor + 22 + view.getUint16(cursor + 20, true) === tail.length) { end = cursor; break; }
   }
   if (end < 0) throw corrupt();
   const count = view.getUint16(end + 10, true);
   const centralSize = view.getUint32(end + 12, true);
   const centralOffset = view.getUint32(end + 16, true);
+  if (count === 0xffff || centralSize === 0xffffffff || centralOffset === 0xffffffff) throw zip64();
+  const centralEnd = tailOffset + end;
   if (view.getUint16(end + 4, true) !== 0 || view.getUint16(end + 6, true) !== 0
-    || view.getUint16(end + 8, true) !== count || count === 0xffff
-    || centralSize === 0xffffffff || centralOffset === 0xffffffff
-    || centralOffset + centralSize !== end) throw corrupt();
-  if (count > MAX_ENTRIES) throw new ApiError('В ZIP допускается не больше 200 записей.', 413);
+    || view.getUint16(end + 8, true) !== count || centralOffset + centralSize !== centralEnd) throw corrupt();
+  if (count > IMPORT_LIMITS.archiveEntries) throw new ApiError(IMPORT_LIMIT_TEXT.entries, 413);
   let cursor = centralOffset;
   let expanded = 0;
   const entries: ZipEntry[] = [];
   const ranges: [number, number][] = [];
+  // Separate caches prevent jumping between catalogue and local headers from rereading big slices.
+  const centralReader = new BlobReader(file);
+  const localReader = new BlobReader(file);
   for (let index = 0; index < count; index++) {
-    if (cursor + 46 > end || view.getUint32(cursor, true) !== 0x02014b50) throw corrupt();
-    const flags = view.getUint16(cursor + 8, true);
-    const method = view.getUint16(cursor + 10, true);
-    const crc = view.getUint32(cursor + 16, true);
-    const compressedSize = view.getUint32(cursor + 20, true);
-    const size = view.getUint32(cursor + 24, true);
-    const nameLength = view.getUint16(cursor + 28, true);
-    const extraLength = view.getUint16(cursor + 30, true);
-    const commentLength = view.getUint16(cursor + 32, true);
-    const startDisk = view.getUint16(cursor + 34, true);
-    const external = view.getUint32(cursor + 38, true);
-    const offset = view.getUint32(cursor + 42, true);
-    if (!nameLength || cursor + 46 + nameLength + extraLength + commentLength > end
-      || startDisk !== 0 || compressedSize === 0xffffffff || size === 0xffffffff || offset === 0xffffffff) throw corrupt();
+    if (cursor + 46 > centralEnd) throw corrupt();
+    const header = dataView(await centralReader.read(cursor, 46));
+    if (header.getUint32(0, true) !== 0x02014b50) throw corrupt();
+    const flags = header.getUint16(8, true);
+    const method = header.getUint16(10, true);
+    const crc = header.getUint32(16, true);
+    const compressedSize = header.getUint32(20, true);
+    const size = header.getUint32(24, true);
+    const nameLength = header.getUint16(28, true);
+    const extraLength = header.getUint16(30, true);
+    const commentLength = header.getUint16(32, true);
+    const startDisk = header.getUint16(34, true);
+    const external = header.getUint32(38, true);
+    const offset = header.getUint32(42, true);
+    if (compressedSize === 0xffffffff || size === 0xffffffff || offset === 0xffffffff) throw zip64();
+    if (!nameLength || cursor + 46 + nameLength + extraLength + commentLength > centralEnd || startDisk !== 0) throw corrupt();
     if (flags & (1 | 64)) throw new ApiError('Зашифрованные ZIP не поддерживаются.', 400);
     if (flags & ~(2 | 4 | 8 | 2048)) throw corrupt();
     // UTF-8 is required by modern ZIP writers; ASCII works without the UTF-8 flag too.
-    const nameBytes = data.subarray(cursor + 46, cursor + 46 + nameLength);
+    const nameBytes = await centralReader.read(cursor + 46, nameLength);
     let name: string;
     try { name = new TextDecoder('utf-8', { fatal: true }).decode(nameBytes); }
     catch { throw new ApiError('Имена файлов ZIP должны быть в UTF-8. Пересоздайте архив с UTF-8 именами.', 400); }
@@ -168,58 +214,66 @@ function zipEntries(data: Uint8Array): ZipEntry[] {
     }
     if (((external >>> 16) & 0xf000) === 0xa000) throw new ApiError('Символические ссылки в ZIP не поддерживаются.', 400);
     expanded += size;
-    if (expanded > MAX_EXPANDED_BYTES) throw new ApiError('Распакованный ZIP превышает 64 МиБ.', 413);
-    if (offset + 30 > centralOffset || view.getUint32(offset, true) !== 0x04034b50) throw corrupt();
-    const localNameLength = view.getUint16(offset + 26, true);
-    const localExtraLength = view.getUint16(offset + 28, true);
+    if (expanded > IMPORT_LIMITS.expandedBytes) throw new ApiError(IMPORT_LIMIT_TEXT.expanded, 413);
+    if (offset + 30 > centralOffset) throw corrupt();
+    const local = dataView(await localReader.read(offset, 30));
+    if (local.getUint32(0, true) !== 0x04034b50) throw corrupt();
+    const localNameLength = local.getUint16(26, true);
+    const localExtraLength = local.getUint16(28, true);
     const dataOffset = offset + 30 + localNameLength + localExtraLength;
-    if (view.getUint16(offset + 6, true) !== flags || view.getUint16(offset + 8, true) !== method
-      || dataOffset > centralOffset || compressedSize > centralOffset - dataOffset || localNameLength !== nameLength
-      || nameBytes.some((byte, nameIndex) => byte !== data[offset + 30 + nameIndex])) throw corrupt();
-    if (!(flags & 8) && (view.getUint32(offset + 14, true) !== crc
-      || view.getUint32(offset + 18, true) !== compressedSize || view.getUint32(offset + 22, true) !== size)) throw corrupt();
+    if (local.getUint16(6, true) !== flags || local.getUint16(8, true) !== method
+      || dataOffset > centralOffset || compressedSize > centralOffset - dataOffset || localNameLength !== nameLength) throw corrupt();
+    const localName = await localReader.read(offset + 30, localNameLength);
+    if (nameBytes.some((byte, nameIndex) => byte !== localName[nameIndex])) throw corrupt();
+    if (!(flags & 8) && (local.getUint32(14, true) !== crc
+      || local.getUint32(18, true) !== compressedSize || local.getUint32(22, true) !== size)) throw corrupt();
     ranges.push([offset, dataOffset + compressedSize]);
-    entries.push({ name, method, crc, size, compressedSize, dataOffset, directory: name.endsWith('/') });
+    const directory = name.endsWith('/');
+    const png = !directory && /\.png$/i.test(name);
+    const basename = name.split('/').at(-1)!;
+    // Names are validated in full, but huge path strings need not stay in the manifest.
+    const displayName = png ? (basename.length > 240 ? `${basename.slice(0, 236)}.png` : basename) : name.slice(0, 200);
+    entries.push({ name: displayName, png, method, crc, size, compressedSize, dataOffset, directory });
     cursor += 46 + nameLength + extraLength + commentLength;
   }
-  if (cursor !== end) throw corrupt();
+  if (cursor !== centralEnd) throw corrupt();
   ranges.sort((a, b) => a[0] - b[0]);
   if (ranges.some((range, index) => index > 0 && range[0] < ranges[index - 1]![1])) throw corrupt();
   return entries;
 }
 
-async function expandPng(data: Uint8Array, entry: ZipEntry): Promise<Uint8Array> {
-  if (entry.size > MAX_FILE_BYTES) throw new ApiError('PNG в ZIP превышает 8 МиБ.', 413);
-  const compressed = data.subarray(entry.dataOffset, entry.dataOffset + entry.compressedSize);
+async function expandPng(file: Blob, entry: ZipEntry): Promise<Uint8Array> {
+  if (entry.size > IMPORT_LIMITS.pngBytes) throw new ApiError(IMPORT_LIMIT_TEXT.png, 413);
   if (entry.method === 0) {
+    if (entry.compressedSize !== entry.size) throw new ApiError('Размер файла ZIP не совпадает с заголовком.', 400);
+    const compressed = new Uint8Array(await file.slice(entry.dataOffset, entry.dataOffset + entry.compressedSize).arrayBuffer());
     if (compressed.length !== entry.size || crc32(compressed) !== entry.crc) throw new ApiError('Контрольная сумма ZIP не совпадает: архив повреждён.', 400);
     return compressed;
   }
   if (entry.method !== 8) throw new ApiError('Метод сжатия ZIP не поддерживается. Используйте обычный ZIP (Deflate).', 415);
-  const chunks: Uint8Array[] = [];
+  const result = new Uint8Array(entry.size);
   let total = 0;
-  let complete = false;
-  const inflate = new Inflate((chunk, final) => {
-    total += chunk.length;
-    if (total > entry.size || total > MAX_FILE_BYTES) throw new ApiError('Некорректный или слишком большой файл в ZIP.', 413);
-    chunks.push(chunk);
-    complete ||= final;
-  });
+  let decoder: DecompressionStream;
+  try { decoder = new DecompressionStream('deflate-raw'); }
+  catch { throw new ApiError('Для распаковки ZIP нужен современный браузер с DecompressionStream (deflate-raw). Обновите браузер или загрузите PNG напрямую.', 415); }
+  const reader = file.slice(entry.dataOffset, entry.dataOffset + entry.compressedSize).stream().pipeThrough(decoder).getReader();
   try {
-    // Bounded input chunks prevent one dishonest stream from expanding unboundedly.
-    for (let offset = 0; offset < compressed.length; offset += 1024) {
-      inflate.push(compressed.subarray(offset, offset + 1024), offset + 1024 >= compressed.length);
-      if (offset && offset % (64 * 1024) === 0) await new Promise<void>(resolve => setTimeout(resolve, 0));
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value.length > entry.size - total) throw new ApiError('Некорректный или слишком большой файл в ZIP.', 413);
+      result.set(value, total);
+      total += value.length;
     }
-    if (!compressed.length) inflate.push(compressed, true);
   } catch (error) {
     if (error instanceof ApiError) throw error;
     throw new ApiError('Сжатый файл ZIP повреждён.', 400);
+  } finally {
+    await reader.cancel().catch(() => undefined);
+    reader.releaseLock();
   }
-  if (!complete || total !== entry.size) throw new ApiError('Размер распакованного файла ZIP не совпадает с заголовком.', 400);
-  const result = new Uint8Array(total);
-  let cursor = 0;
-  for (const chunk of chunks) { result.set(chunk, cursor); cursor += chunk.length; }
+  // The native decoder verifies stream termination and rejects compressed trailing junk.
+  if (total !== entry.size) throw new ApiError('Размер распакованного файла ZIP не совпадает с заголовком.', 400);
   if (crc32(result) !== entry.crc) throw new ApiError('Контрольная сумма ZIP не совпадает: архив повреждён.', 400);
   return result;
 }
@@ -231,47 +285,114 @@ async function importAssets(body: RequestInit['body']): Promise<{ assets: Asset[
     throw new ApiError('Добавьте PNG или ZIP с PNG в поле files.', 400);
   }
   const uploadFiles = files as File[];
-  if (uploadFiles.length > 32 || uploadFiles.some(file => file.size > MAX_FILE_BYTES)
-    || uploadFiles.reduce((sum, file) => sum + file.size, 0) > MAX_UPLOAD_BYTES) {
-    throw new ApiError('Превышен лимит загрузки: до 32 файлов, 8 МиБ на файл и 16 МиБ суммарно.', 413);
-  }
-  const prepared: PreparedBrowserAsset[] = [];
+  if (uploadFiles.length > IMPORT_LIMITS.files) throw new ApiError(IMPORT_LIMIT_TEXT.files, 413);
+  if (uploadFiles.reduce((sum, file) => sum + file.size, 0) > IMPORT_LIMITS.uploadBytes) throw new ApiError(IMPORT_LIMIT_TEXT.upload, 413);
   const warnings: string[] = [];
+  let skipped = 0;
+  let total = 0;
   let expanded = 0;
+  // Preflight all budgets without retaining archive data or PNGs. Entry arrays are short-lived.
   for (const file of uploadFiles) {
     if (/\.dungeondraft_pack$/i.test(file.name)) {
       throw new ApiError('Нативный .dungeondraft_pack пока не поддерживается. Экспортируйте PNG и загрузите их напрямую или в ZIP.', 415);
     }
     if (!/\.(png|zip)$/i.test(file.name)) throw new ApiError('Поддерживаются PNG и ZIP с PNG.', 415);
-    const data = new Uint8Array(await file.arrayBuffer());
     if (/\.png$/i.test(file.name)) {
-      expanded += data.length;
-      prepared.push(await validatePng(data, file.name));
+      if (file.size > IMPORT_LIMITS.pngBytes) throw new ApiError(IMPORT_LIMIT_TEXT.png, 413);
+      expanded += file.size;
+      total++;
     } else {
-      const entries = zipEntries(data);
+      if (file.size > IMPORT_LIMITS.archiveBytes) throw new ApiError(IMPORT_LIMIT_TEXT.archive, 413);
+      const entries = await zipEntries(file);
       expanded += entries.reduce((sum, entry) => sum + entry.size, 0);
-      if (expanded > MAX_EXPANDED_BYTES) throw new ApiError('Одна загрузка допускает до 200 PNG и до 64 МиБ после распаковки.', 413);
       for (const entry of entries) {
         if (entry.directory) continue;
-        if (!/\.png$/i.test(entry.name)) { warnings.push(`Пропущен «${entry.name.slice(0, 200)}»: импортируются только PNG.`); continue; }
-        if (prepared.length >= MAX_ENTRIES) throw new ApiError('Одна загрузка допускает до 200 PNG и до 64 МиБ после распаковки.', 413);
-        prepared.push(await validatePng(await expandPng(data, entry), entry.name, file.name.replace(/\.zip$/i, '')));
+        if (!entry.png) {
+          skipped++;
+          if (warnings.length < 100) warnings.push(`Пропущен «${entry.name.slice(0, 200)}»: импортируются только PNG.`);
+          continue;
+        }
+        if (entry.size > IMPORT_LIMITS.pngBytes) throw new ApiError(IMPORT_LIMIT_TEXT.png, 413);
+        total++;
       }
     }
-    if (expanded > MAX_EXPANDED_BYTES || prepared.length > MAX_ENTRIES) {
-      throw new ApiError('Одна загрузка допускает до 200 PNG и до 64 МиБ после распаковки.', 413);
+    if (expanded > IMPORT_LIMITS.expandedBytes || total > IMPORT_LIMITS.files) {
+      throw new ApiError(IMPORT_LIMIT_TEXT.batch, 413);
     }
   }
-  if (!prepared.length) throw new ApiError('В архиве не найдены PNG. Нативный набор Dungeondraft не импортируется.', 400);
-  const saved = prepared.map(item => ({
-    id: crypto.randomUUID(), name: item.name, filename: item.filename, width: item.width, height: item.height,
-    category: 'objects' as const, tags: [], createdAt: new Date().toISOString(), blob: item.blob,
-    ...(item.pack ? { pack: item.pack } : {}),
-  }));
-  await transaction<void>(['assets'], 'readwrite', context => {
-    for (const asset of saved) context.tx.objectStore('assets').add(asset);
-  });
-  return { assets: saved.map(publicAsset), warnings };
+  if (!total) throw new ApiError('В архиве не найдены PNG. Нативный набор Dungeondraft не импортируется.', 400);
+  if (skipped > 100) warnings.push(`Дополнительно пропущено ${skipped - 100} файлов: импортируются только PNG.`);
+  const batchId = crypto.randomUUID();
+  let processed = 0;
+  const progress = (phase: 'validate' | 'commit', count: number) => {
+    window.dispatchEvent(new CustomEvent('dungeonai-import-progress', { detail: { processed: count, total, phase } }));
+  };
+  async function stage(item: PreparedBrowserAsset) {
+    const staged: StagedAsset = {
+      id: crypto.randomUUID(), name: item.name, filename: item.filename, width: item.width, height: item.height,
+      category: 'objects', tags: [], createdAt: new Date().toISOString(), blob: item.blob,
+      batchId, stagedAt: Date.now(), ...(item.pack ? { pack: item.pack } : {}),
+    };
+    await transaction<void>(['importStaging'], 'readwrite', context => { context.tx.objectStore('importStaging').add(staged); });
+    progress('validate', ++processed);
+  }
+  try {
+    progress('validate', 0);
+    for (const file of uploadFiles) {
+      if (/\.png$/i.test(file.name)) {
+        await stage(await validatePng(new Uint8Array(await file.arrayBuffer()), file.name));
+      } else {
+        // Rereading small headers avoids retaining all manifests for a potentially huge batch.
+        for (const entry of await zipEntries(file)) {
+          if (entry.directory || !entry.png) continue;
+          await stage(await validatePng(await expandPng(file, entry), entry.name, file.name.replace(/\.zip$/i, '')));
+        }
+      }
+    }
+    progress('commit', 0);
+    const savedIds = await transaction<string[]>(['assets', 'importStaging'], 'readwrite', context => {
+      const ids: string[] = [];
+      const staging = context.tx.objectStore('importStaging');
+      const cursorRequest = staging.index('batchId').openCursor(IDBKeyRange.only(batchId));
+      context.request(cursorRequest, cursor => {
+        if (!cursor) {
+          if (ids.length !== total) throw new ApiError('Пакет импорта неполон. Повторите загрузку.', 500);
+          context.set(ids);
+          return;
+        }
+        const { batchId: _batch, stagedAt: _time, ...asset } = cursor.value as StagedAsset;
+        context.request(context.tx.objectStore('assets').add(asset), () => {
+          ids.push(asset.id);
+          cursor.delete();
+          progress('commit', ids.length);
+          cursor.continue();
+        });
+      });
+    });
+    // Create Blob URLs only after the entire publishing transaction has committed.
+    let removedAfterCommit = 0;
+    const saved = await transaction<StoredAsset[]>(['assets'], 'readonly', context => {
+      const records: StoredAsset[] = [];
+      const store = context.tx.objectStore('assets');
+      for (const id of savedIds) context.request<StoredAsset | undefined>(store.get(id), asset => {
+        if (asset) records.push(asset);
+        else removedAfterCommit++;
+      });
+      context.set(records);
+    });
+    if (removedAfterCommit) warnings.push(`После импорта удалено ассетов в другой вкладке: ${removedAfterCommit}.`);
+    return { assets: saved.map(publicAsset), warnings };
+  } catch (error) {
+    await transaction<void>(['importStaging'], 'readwrite', context => {
+      const staging = context.tx.objectStore('importStaging');
+      context.request(staging.index('batchId').openKeyCursor(IDBKeyRange.only(batchId)), cursor => {
+        if (!cursor) return;
+        staging.delete(cursor.primaryKey);
+        cursor.continue();
+      });
+    }).catch(() => undefined);
+    throw error;
+  }
 }
 
 function jsonBody(options?: RequestInit): unknown {

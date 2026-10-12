@@ -1,14 +1,17 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import type { Server } from 'node:http';
+import { setTimeout as delay } from 'node:timers/promises';
+import { request, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { PNG } from 'pngjs';
 import { zipSync } from 'fflate';
 import { createApp } from '../server/app.js';
 import type { Asset, Capabilities, MapDocument } from '../shared/types.js';
+import { IMPORT_LIMITS, IMPORT_LIMIT_TEXT } from '../shared/importLimits.js';
+import { largePngFixture } from './uploadFixtures.js';
 
 function pngFixture(): Buffer {
   const png = new PNG({ width: 3, height: 2 });
@@ -51,6 +54,47 @@ function multipart(files: { name: string; data: Uint8Array }[]): FormData {
 
 function jsonBody(value: unknown): RequestInit {
   return { headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(value) };
+}
+
+function zipDeclaringEntries(count: number): Buffer {
+  const original = Buffer.from(zipSync({ 'one.png': pngFixture() }));
+  const endOffset = original.lastIndexOf(Buffer.from([0x50, 0x4b, 0x05, 0x06]));
+  assert.ok(endOffset >= 0);
+  const zip64End = Buffer.alloc(56);
+  zip64End.writeUInt32LE(0x06064b50, 0);
+  zip64End.writeBigUInt64LE(44n, 4);
+  zip64End.writeUInt16LE(45, 12);
+  zip64End.writeUInt16LE(45, 14);
+  zip64End.writeBigUInt64LE(BigInt(count), 24);
+  zip64End.writeBigUInt64LE(BigInt(count), 32);
+  zip64End.writeBigUInt64LE(BigInt(original.readUInt32LE(endOffset + 12)), 40);
+  zip64End.writeBigUInt64LE(BigInt(original.readUInt32LE(endOffset + 16)), 48);
+  const locator = Buffer.alloc(20);
+  locator.writeUInt32LE(0x07064b50, 0);
+  locator.writeBigUInt64LE(BigInt(endOffset), 8);
+  locator.writeUInt32LE(1, 16);
+  const end = Buffer.from(original.subarray(endOffset));
+  end.writeUInt16LE(0xffff, 8);
+  end.writeUInt16LE(0xffff, 10);
+  end.writeUInt32LE(0xffffffff, 12);
+  end.writeUInt32LE(0xffffffff, 16);
+  return Buffer.concat([original.subarray(0, endOffset), zip64End, locator, end]);
+}
+
+async function declaredUpload(base: string, bytes: number): Promise<{ status: number; error: string }> {
+  return new Promise((resolve, reject) => {
+    const outgoing = request(`${base}/api/assets`, {
+      method: 'POST', headers: { 'Content-Type': 'multipart/form-data; boundary=large', 'Content-Length': String(bytes), Connection: 'close' },
+    }, (incoming) => {
+      let body = '';
+      incoming.setEncoding('utf8');
+      incoming.on('data', (chunk: string) => { body += chunk; });
+      incoming.on('end', () => resolve({ status: incoming.statusCode!, error: (JSON.parse(body) as { error: string }).error }));
+      incoming.on('error', reject);
+    });
+    outgoing.on('error', reject);
+    outgoing.end();
+  });
 }
 
 test('PNG import decodes pixels, persists across server restart, and supports metadata edits', async () => {
@@ -136,33 +180,108 @@ test('invalid PNGs, traversal archives, excessive entries, and invalid batches d
     assert.equal(fake.status, 400);
     const traversal = zipSync({ '../escape.png': pngFixture() });
     assert.equal((await fetch(`${base}/api/assets`, { method: 'POST', body: multipart([{ name: 'traversal.zip', data: traversal }]) })).status, 400);
-    const crowded = zipSync(Object.fromEntries(Array.from({ length: 201 }, (_, i) => [`${i}.txt`, new Uint8Array()])));
-    assert.equal((await fetch(`${base}/api/assets`, { method: 'POST', body: multipart([{ name: 'crowded.zip', data: crowded }]) })).status, 413);
+    const crowded = zipDeclaringEntries(IMPORT_LIMITS.archiveEntries + 1);
+    const excessive = await fetch(`${base}/api/assets`, { method: 'POST', body: multipart([{ name: 'crowded.zip', data: crowded }]) });
+    assert.equal(excessive.status, 413);
+    assert.equal((await excessive.json() as { error: string }).error, IMPORT_LIMIT_TEXT.entries);
     assert.deepEqual(await (await fetch(`${base}/api/assets`)).json(), []);
   });
 });
 
-test('multipart byte budgets and ZIP expansion budgets reject oversized requests before import', async () => {
-  await withServer(async (base) => {
-    const tooLargeFile = new Uint8Array(8 * 1024 * 1024 + 1);
-    const perFile = await fetch(`${base}/api/assets`, {
-      method: 'POST', body: multipart([{ name: 'huge.png', data: tooLargeFile }]),
-    });
-    assert.equal(perFile.status, 413);
-    const medium = new Uint8Array(6 * 1024 * 1024);
-    const total = await fetch(`${base}/api/assets`, {
-      method: 'POST', body: multipart(['one.png', 'two.png', 'three.png'].map((name) => ({ name, data: medium }))),
-    });
+test('new upload, PNG geometry, per-image ZIP and aggregate expansion limits reject excess without large allocations', async () => {
+  await withServer(async (base, dataDir) => {
+    const total = await declaredUpload(base, IMPORT_LIMITS.uploadBytes + 1);
     assert.equal(total.status, 413);
-    const expansion = Buffer.from(zipSync({ 'bomb.png': pngFixture() }));
-    const centralDirectory = expansion.indexOf(Buffer.from([0x50, 0x4b, 0x01, 0x02]));
-    assert.ok(centralDirectory >= 0);
-    expansion.writeUInt32LE(65 * 1024 * 1024, centralDirectory + 24);
-    const archive = await fetch(`${base}/api/assets`, {
-      method: 'POST', body: multipart([{ name: 'bomb.zip', data: expansion }]),
-    });
+    assert.equal(total.error, IMPORT_LIMIT_TEXT.upload);
+    const perImage = Buffer.from(zipSync({ 'huge.png': pngFixture() }));
+    const centralDirectory = perImage.indexOf(Buffer.from([0x50, 0x4b, 0x01, 0x02]));
+    perImage.writeUInt32LE(IMPORT_LIMITS.pngBytes + 1, centralDirectory + 24);
+    const oversizedImage = await fetch(`${base}/api/assets`, { method: 'POST', body: multipart([{ name: 'huge.zip', data: perImage }]) });
+    assert.equal(oversizedImage.status, 413);
+    assert.equal((await oversizedImage.json() as { error: string }).error, IMPORT_LIMIT_TEXT.png);
+
+    const expansion = Buffer.from(zipSync(Object.fromEntries(Array.from({ length: 5 }, (_, index) => [`${index}.txt`, new TextEncoder().encode('small compressed file')]))));
+    let central = expansion.indexOf(Buffer.from([0x50, 0x4b, 0x01, 0x02]));
+    while (central >= 0) {
+      expansion.writeUInt32LE(2 * 1024 * 1024 * 1024, central + 24);
+      central = expansion.indexOf(Buffer.from([0x50, 0x4b, 0x01, 0x02]), central + 46);
+    }
+    const archive = await fetch(`${base}/api/assets`, { method: 'POST', body: multipart([{ name: 'bomb.zip', data: expansion }]) });
     assert.equal(archive.status, 413);
+    assert.equal((await archive.json() as { error: string }).error, IMPORT_LIMIT_TEXT.expanded);
+    const excessiveSide = Buffer.from(pngFixture());
+    excessiveSide.writeUInt32BE(IMPORT_LIMITS.pngSide + 1, 16);
+    const dimensions = await fetch(`${base}/api/assets`, { method: 'POST', body: multipart([{ name: 'wide.png', data: excessiveSide }]) });
+    assert.equal(dimensions.status, 400);
+    assert.equal((await dimensions.json() as { error: string }).error, IMPORT_LIMIT_TEXT.pixels);
     assert.deepEqual(await (await fetch(`${base}/api/assets`)).json(), []);
+    assert.equal((await readdir(dataDir)).some((name) => name.startsWith('.import-')), false);
+  });
+});
+
+test('larger PNGs and batches exceeding old file and ZIP-entry ceilings import from disk atomically', async () => {
+  await withServer(async (base, dataDir) => {
+    const large = largePngFixture();
+    assert.ok(large.length > 8 * 1024 * 1024);
+    const largeResponse = await fetch(`${base}/api/assets`, { method: 'POST', body: multipart([{ name: 'large.png', data: large }]) });
+    assert.equal(largeResponse.status, 201);
+    const largeAsset = (await largeResponse.json() as { assets: Asset[] }).assets[0]!;
+    assert.equal(largeAsset.width, 1536);
+    assert.deepEqual(Buffer.from(await (await fetch(`${base}${largeAsset.url}`)).arrayBuffer()), large);
+
+    const wide = PNG.sync.write(new PNG({ width: 9000, height: 1 }));
+    const wideResponse = await fetch(`${base}/api/assets`, { method: 'POST', body: multipart([{ name: 'wide.png', data: wide }]) });
+    assert.equal(wideResponse.status, 201);
+    assert.equal((await wideResponse.json() as { assets: Asset[] }).assets[0]!.width, 9000);
+
+    const direct = await fetch(`${base}/api/assets`, { method: 'POST', body: multipart(Array.from({ length: 33 }, (_, index) => ({ name: `direct-${index}.png`, data: pngFixture() }))) });
+    assert.equal(direct.status, 201);
+    assert.equal((await direct.json() as { assets: Asset[] }).assets.length, 33);
+    const baseline = 35;
+    const archive = zipSync(Object.fromEntries(Array.from({ length: 201 }, (_, index) => [`pack/${index}.png`, pngFixture()])));
+    let complete = false;
+    const importing = fetch(`${base}/api/assets`, { method: 'POST', body: multipart([{ name: 'large-library.zip', data: archive }]) }).finally(() => { complete = true; });
+    const observed: number[] = [];
+    while (!complete) {
+      observed.push((await (await fetch(`${base}/api/assets`)).json() as Asset[]).length);
+    }
+    const archived = await importing;
+    assert.equal(archived.status, 201);
+    assert.equal((await archived.json() as { assets: Asset[] }).assets.length, 201);
+    assert.ok(observed.length > 0);
+    assert.ok(observed.every((count) => count === baseline || count === baseline + 201), `Partial batch was visible: ${observed.join(', ')}`);
+    assert.equal((await (await fetch(`${base}/api/assets`)).json() as Asset[]).length, baseline + 201);
+    assert.equal((await readdir(dataDir)).some((name) => name.startsWith('.import-')), false);
+  });
+});
+
+test('an interrupted upload releases its import slot and removes disk staging', async () => {
+  await withServer(async (base, dataDir) => {
+    const pending = request(`${base}/api/assets`, {
+      method: 'POST', headers: { 'Content-Type': 'multipart/form-data; boundary=interrupted', 'Content-Length': 1024 * 1024 },
+    });
+    pending.on('error', () => undefined);
+    pending.write(Buffer.concat([
+      Buffer.from('--interrupted\r\nContent-Disposition: form-data; name="files"; filename="partial.png"\r\nContent-Type: image/png\r\n\r\n'),
+      pngFixture(),
+    ]));
+    try {
+      const deadline = Date.now() + 3000;
+      while (!(await readdir(dataDir)).some((name) => name.startsWith('.import-'))) {
+        assert.ok(Date.now() < deadline, 'Upload never started');
+        await delay(5);
+      }
+      const competing = await fetch(`${base}/api/assets`, { method: 'POST', body: multipart([{ name: 'competing.png', data: pngFixture() }]) });
+      assert.equal(competing.status, 429);
+    } finally { pending.destroy(); }
+    const deadline = Date.now() + 3000;
+    while ((await readdir(dataDir)).some((name) => name.startsWith('.import-'))) {
+      assert.ok(Date.now() < deadline, 'Interrupted staging was not removed');
+      await delay(5);
+    }
+    const resumed = await fetch(`${base}/api/assets`, { method: 'POST', body: multipart([{ name: 'resumed.png', data: pngFixture() }]) });
+    assert.equal(resumed.status, 201);
+    assert.equal((await (await fetch(`${base}/api/assets`)).json() as Asset[]).length, 1);
   });
 });
 

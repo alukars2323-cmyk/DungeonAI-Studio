@@ -11,9 +11,34 @@ export interface RenderOptions {
 }
 
 const loadedImages = new Map<string, HTMLImageElement>();
-const loadingImages = new Map<string, Promise<HTMLImageElement>>();
+const assetIndexes = new WeakMap<Asset[], Map<string, Asset>>();
+interface ImageLoad {
+  asset: Asset;
+  href: string;
+  promise: Promise<HTMLImageElement>;
+  resolve: (image: HTMLImageElement) => void;
+  reject: (error: Error) => void;
+  state: 'queued' | 'loading' | 'settled';
+  consumers: number;
+}
+const loadingImages = new Map<string, ImageLoad>();
+const imageQueue: ImageLoad[] = [];
+const retainedImages = new Map<string, number>();
+const imageRecency = new Map<string, number>();
+const MAX_PARALLEL_IMAGE_LOADS = 2;
+const MAX_INACTIVE_IMAGES = 16;
+const MAX_INACTIVE_IMAGE_BYTES = 64 * 1024 * 1024;
+let imageLoadCount = 0;
+let recencyCounter = 0;
+let evictionScheduled = false;
 const textures = new Map<string, HTMLCanvasElement>();
 const perimeterCache = new Map<string, Segment[]>();
+
+function assetIndex(assets: Asset[]): Map<string, Asset> {
+  let index = assetIndexes.get(assets);
+  if (!index) { index = new Map(assets.map(asset => [asset.id, asset])); assetIndexes.set(assets, index); }
+  return index;
+}
 
 function seedNumber(value: string): number {
   let seed = 2166136261;
@@ -31,43 +56,153 @@ function randomSource(seed: number): () => number {
   };
 }
 
-/** Only same-origin asset images are accepted, so PNG exports keep an untainted canvas. */
-export function loadAssetImage(asset: Asset): Promise<HTMLImageElement> {
-  const cached = loadedImages.get(asset.url);
-  if (cached) return Promise.resolve(cached);
-  const pending = loadingImages.get(asset.url);
-  if (pending) return pending;
-  const promise = new Promise<HTMLImageElement>((resolve, reject) => {
-    const url = new URL(asset.url, window.location.href);
-    if (url.origin !== window.location.origin) {
-      reject(new Error(`Ассет «${asset.name}» должен загружаться с сервера приложения.`));
-      return;
+function scheduleImageEviction(): void {
+  if (evictionScheduled) return;
+  evictionScheduled = true;
+  // React replaces scene leases within one effect flush. Avoid evicting identical
+  // images between cleanup of the previous document and setup of its next edit.
+  queueMicrotask(() => {
+    evictionScheduled = false;
+    const inactive = Array.from(loadedImages.keys()).filter(url => !retainedImages.has(url) && !loadingImages.has(url));
+    inactive.sort((a, b) => (imageRecency.get(a) ?? 0) - (imageRecency.get(b) ?? 0));
+    let count = inactive.length;
+    let bytes = inactive.reduce((sum, url) => {
+      const image = loadedImages.get(url)!;
+      return sum + image.naturalWidth * image.naturalHeight * 4;
+    }, 0);
+    for (const url of inactive) {
+      if (count <= MAX_INACTIVE_IMAGES && bytes <= MAX_INACTIVE_IMAGE_BYTES) break;
+      const image = loadedImages.get(url)!;
+      bytes -= image.naturalWidth * image.naturalHeight * 4; count--;
+      // Drop our reference, never blank src: another caller can still own this image.
+      loadedImages.delete(url); imageRecency.delete(url);
     }
-    const img = new Image();
-    img.onload = () => {
-      if (!img.naturalWidth || !img.naturalHeight) { reject(new Error(`Повреждён PNG «${asset.name}».`)); return; }
-      loadedImages.set(asset.url, img);
-      resolve(img);
-    };
-    img.onerror = () => reject(new Error(`Не удалось загрузить PNG «${asset.name}».`));
-    img.src = url.href;
-  }).finally(() => { loadingImages.delete(asset.url); });
-  loadingImages.set(asset.url, promise);
-  return promise;
+  });
 }
 
-export async function preloadMapAssets(document: MapDocument, assets: Asset[]): Promise<void> {
-  await Promise.all(referencedAssetIds(document).map(id => {
-    const asset = assets.find(item => item.id === id);
-    if (!asset) return Promise.reject(new Error(`Ассет ${id} отсутствует в библиотеке. Загрузите исходный PNG перед экспортом.`));
-    return loadAssetImage(asset);
+function retainAssetImages(assets: Asset[]): () => void {
+  const urls = new Set(assets.map(asset => asset.url));
+  for (const url of urls) retainedImages.set(url, (retainedImages.get(url) ?? 0) + 1);
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    for (const url of urls) {
+      const count = retainedImages.get(url) ?? 0;
+      if (count <= 1) retainedImages.delete(url); else retainedImages.set(url, count - 1);
+    }
+    scheduleImageEviction();
+  };
+}
+
+/** Keep the displayed document or an in-progress export's original PNGs alive. */
+export function retainMapAssetImages(document: MapDocument, assets: Asset[]): () => void {
+  const index = assetIndex(assets);
+  return retainAssetImages(referencedAssetIds(document).flatMap(id => {
+    const asset = index.get(id);
+    return asset ? [asset] : [];
   }));
+}
+
+function abortError(): DOMException { return new DOMException('Загрузка изображений отменена.', 'AbortError'); }
+
+function drainImageQueue(): void {
+  while (imageLoadCount < MAX_PARALLEL_IMAGE_LOADS && imageQueue.length) {
+    const job = imageQueue.shift()!;
+    if (job.state !== 'queued') continue;
+    job.state = 'loading'; imageLoadCount++;
+    const img = new Image();
+    const finish = (error?: Error) => {
+      if (job.state !== 'loading') return;
+      job.state = 'settled'; imageLoadCount--;
+      img.onload = img.onerror = null;
+      if (loadingImages.get(job.asset.url) === job) loadingImages.delete(job.asset.url);
+      if (error) job.reject(error);
+      else {
+        loadedImages.set(job.asset.url, img);
+        imageRecency.set(job.asset.url, ++recencyCounter);
+        job.resolve(img);
+      }
+      scheduleImageEviction(); drainImageQueue();
+    };
+    img.onload = () => finish(img.naturalWidth && img.naturalHeight ? undefined : new Error(`Повреждён PNG «${job.asset.name}».`));
+    img.onerror = () => finish(new Error(`Не удалось загрузить PNG «${job.asset.name}».`));
+    img.src = job.href;
+  }
+}
+
+/** Same-origin images and a shared queue keep all previews/exports to two loads. */
+export function loadAssetImage(asset: Asset, signal?: AbortSignal): Promise<HTMLImageElement> {
+  if (signal?.aborted) return Promise.reject(abortError());
+  const cached = loadedImages.get(asset.url);
+  if (cached) { imageRecency.set(asset.url, ++recencyCounter); return Promise.resolve(cached); }
+  let job = loadingImages.get(asset.url);
+  if (!job) {
+    const url = new URL(asset.url, window.location.href);
+    if (url.origin !== window.location.origin) return Promise.reject(new Error(`Ассет «${asset.name}» должен загружаться с сервера приложения.`));
+    let resolve!: (image: HTMLImageElement) => void;
+    let reject!: (error: Error) => void;
+    const promise = new Promise<HTMLImageElement>((res, rej) => { resolve = res; reject = rej; });
+    job = { asset, href: url.href, promise, resolve, reject, state: 'queued', consumers: 0 };
+    loadingImages.set(asset.url, job); imageQueue.push(job);
+  }
+  const sharedJob = job;
+  sharedJob.consumers++;
+  const result = new Promise<HTMLImageElement>((resolve, reject) => {
+    let done = false;
+    const cleanup = () => {
+      signal?.removeEventListener('abort', cancel);
+      sharedJob.consumers--;
+      if (sharedJob.state === 'queued' && sharedJob.consumers === 0) {
+        sharedJob.state = 'settled';
+        const index = imageQueue.indexOf(sharedJob);
+        if (index !== -1) imageQueue.splice(index, 1);
+        if (loadingImages.get(asset.url) === sharedJob) loadingImages.delete(asset.url);
+        sharedJob.reject(abortError());
+      }
+    };
+    const cancel = () => { if (!done) { done = true; cleanup(); reject(abortError()); } };
+    signal?.addEventListener('abort', cancel, { once: true });
+    sharedJob.promise.then(img => {
+      if (done) return;
+      done = true; cleanup(); resolve(img);
+    }, error => {
+      if (done) return;
+      done = true; cleanup(); reject(error);
+    });
+  });
+  drainImageQueue();
+  return result;
+}
+
+export async function preloadMapAssets(document: MapDocument, assets: Asset[], options: { signal?: AbortSignal } = {}): Promise<void> {
+  const index = assetIndex(assets);
+  const requested = referencedAssetIds(document).map(id => {
+    const asset = index.get(id);
+    if (!asset) throw new Error(`Ассет ${id} отсутствует в библиотеке. Загрузите исходный PNG перед экспортом.`);
+    return asset;
+  });
+  const release = retainAssetImages(requested);
+  let next = 0;
+  let failure: unknown;
+  const worker = async () => {
+    while (next < requested.length && !failure) {
+      if (options.signal?.aborted) { failure = abortError(); return; }
+      const asset = requested[next++];
+      try { await loadAssetImage(asset, options.signal); }
+      catch (error) { failure = error; }
+    }
+  };
+  try {
+    await Promise.all(Array.from({ length: Math.min(MAX_PARALLEL_IMAGE_LOADS, requested.length) }, () => worker()));
+    if (failure) throw failure;
+  } finally { release(); }
 }
 
 /** A tile is one cell wide, while its height follows the source PNG aspect ratio. */
 function assetPattern(ctx: CanvasRenderingContext2D, assetId: string | undefined, assets: Asset[]): CanvasPattern | null {
   if (!assetId) return null;
-  const asset = assets.find(item => item.id === assetId);
+  const asset = assetIndex(assets).get(assetId);
   const image = asset && loadedImages.get(asset.url);
   if (!image) return null;
   const pattern = ctx.createPattern(image, 'repeat');
@@ -315,7 +450,7 @@ function drawObject(ctx: CanvasRenderingContext2D, element: ObjectElement, asset
   ctx.translate((element.x + element.width / 2) * CELL_SIZE, (element.y + element.height / 2) * CELL_SIZE);
   ctx.rotate(element.rotation * Math.PI / 180);
   if (element.assetId) {
-    const asset = assets.find(item => item.id === element.assetId);
+    const asset = assetIndex(assets).get(element.assetId);
     const img = asset && loadedImages.get(asset.url);
     if (img) {
       ctx.shadowColor = 'rgba(0,0,0,0.42)'; ctx.shadowBlur = 4; ctx.shadowOffsetY = 2;
@@ -419,16 +554,19 @@ export function renderMap(ctx: CanvasRenderingContext2D, document: MapDocument, 
 
 export async function exportMapPng(document: MapDocument, assets: Asset[], options: { scale?: number; grid?: boolean; visibleLayers?: VisibleLayers } = {}): Promise<Blob> {
   const scale = Math.max(1, Math.min(3, Number.isFinite(options.scale) ? options.scale! : 1));
-  await preloadMapAssets(document, assets);
-  const canvas = window.document.createElement('canvas');
-  canvas.width = Math.ceil(document.width * CELL_SIZE * scale);
-  canvas.height = Math.ceil(document.height * CELL_SIZE * scale);
-  const ctx = canvas.getContext('2d');
-  if (!ctx) throw new Error('Браузер не смог создать холст для экспорта.');
-  ctx.scale(scale, scale);
-  renderMap(ctx, document, assets, { grid: options.grid, visibleLayers: options.visibleLayers });
-  return new Promise((resolve, reject) => {
-    try { canvas.toBlob(blob => blob ? resolve(blob) : reject(new Error('Браузер не смог сохранить PNG.')), 'image/png'); }
-    catch { reject(new Error('PNG не удалось экспортировать: проверьте доступность загруженных изображений.')); }
-  });
+  const release = retainMapAssetImages(document, assets);
+  try {
+    await preloadMapAssets(document, assets);
+    const canvas = window.document.createElement('canvas');
+    canvas.width = Math.ceil(document.width * CELL_SIZE * scale);
+    canvas.height = Math.ceil(document.height * CELL_SIZE * scale);
+    const ctx = canvas.getContext('2d');
+    if (!ctx) throw new Error('Браузер не смог создать холст для экспорта.');
+    ctx.scale(scale, scale);
+    renderMap(ctx, document, assets, { grid: options.grid, visibleLayers: options.visibleLayers });
+    return await new Promise<Blob>((resolve, reject) => {
+      try { canvas.toBlob(blob => blob ? resolve(blob) : reject(new Error('Браузер не смог сохранить PNG.')), 'image/png'); }
+      catch { reject(new Error('PNG не удалось экспортировать: проверьте доступность загруженных изображений.')); }
+    });
+  } finally { release(); }
 }
